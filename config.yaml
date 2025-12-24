@@ -1,0 +1,73 @@
+
+whitebox_llm:
+  model_name: "meta-llama/Meta-Llama-3-8B-Instruct"  # Use HuggingFace Llama for RL + LoRA
+  use_huggingface: true  # Required for RL/LoRA
+  temperature: 1.0  # Increased for more diversity
+  max_tokens: 150  # Reduced to encourage shorter prompts
+  do_sample: true
+  top_p: 0.95
+  max_new_tokens: 1024
+
+multi_purpose_llm:
+  model_name: "meta-llama/Meta-Llama-3-8B-Instruct"
+  use_huggingface: true
+
+  target_llm:
+    temperature: 0.7
+    max_new_tokens: 256
+    do_sample: true
+    top_p: 0.95
+  
+  eval_llm:
+    temperature: 1.0
+    max_new_tokens: 1024
+    do_sample: true
+    top_p: 0.95
+
+  rule_llm:
+    temperature: 0.5
+    max_new_tokens: 256
+    do_sample: true
+    top_p: 0.95
+
+rl:
+  enable_training: true  # Enable DPO training of white-box LLM (HuggingFace only)
+  learning_rate: 1e-5
+  batch_size: 8
+  num_epochs: 1  # Number of epochs per training step
+  reward_scale: 1.0
+  use_lora: true  # Use LoRA for efficient fine-tuning
+  lora_r: 16  # LoRA rank
+  lora_alpha: 32  # LoRA alpha
+  dpo_beta: 0.1  # DPO beta parameter (controls KL penalty strength)
+  model_output_dir: "./models/whitebox_dpo"  # Directory to save trained models
+
+
+# Rule inference configuration
+rule_inference:
+  min_confidence: 0.7
+  max_rules: 100
+  rules_log_file: null  # Path to JSONL file for logging rules (null = auto-generate in logs/)
+  llm_model: "meta-llama/Meta-Llama-3-8B-Instruct"  # LLM model for generating rule descriptions (HuggingFace or OpenAI)
+  llm_api_key_env: "OPENAI_API_KEY"  # Only needed if using OpenAI model
+  rule_categories:
+    - violence
+    - illegal_activities
+    - misinformation
+    - privacy
+    - hate_speech
+    - self_harm
+    - other
+
+# Pipeline configuration
+pipeline:
+  num_iterations: 1  # TEST: Quick test of new rule bonus
+  prompts_per_iteration: 3
+  eval_prompts_per_rule: 3
+  save_checkpoint_every: 3
+  output_dir: "./output"
+  log_dir: "./logs"
+  num_evaluation_prompts_per_rule:  # For each discovered rule
+    harmful: 5
+    benign: 5
+
