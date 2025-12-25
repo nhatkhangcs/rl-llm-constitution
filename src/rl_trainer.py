@@ -13,6 +13,7 @@ from datasets import Dataset
 from transformers import (
     AutoTokenizer,
     AutoModelForCausalLM,
+    TrainerCallback,
 )
 from trl import DPOTrainer, DPOConfig
 from peft import LoraConfig, get_peft_model, TaskType
@@ -53,7 +54,8 @@ class RLTrainer:
         lora_r,
         lora_alpha,
         output_dir: str = "./models/whitebox_dpo",
-        beta: float = 0.1  # DPO beta parameter (temperature)
+        beta: float = 0.1,  # DPO beta parameter (temperature)
+        wandb_run_name: Optional[str] = None  # Wandb run name (for reusing same run across iterations)
     ):
         """
         Initialize DPO Trainer
@@ -79,6 +81,7 @@ class RLTrainer:
         self.lora_alpha = lora_alpha
         self.output_dir = output_dir
         self.beta = float(beta) if not isinstance(beta, float) else beta
+        self.wandb_run_name = wandb_run_name
         
         print(f"[DPO Trainer] Model loaded")
         
@@ -101,7 +104,7 @@ class RLTrainer:
             learning_rate=self.learning_rate,  # Use converted float value
             per_device_train_batch_size=self.batch_size,  # Use converted int value
             beta=self.beta,  # Use converted float value
-            logging_steps=10,
+            logging_steps=1,  # Log every step to ensure wandb updates frequently
             save_strategy="no",  # Disable checkpoint saving during training (avoids tokenizer serialization issues)
             num_train_epochs=1,
             remove_unused_columns=False,
@@ -109,14 +112,30 @@ class RLTrainer:
             gradient_accumulation_steps=2,  # Accumulate gradients over 2 steps (effective batch size = batch_size * 2)
             dataloader_pin_memory=False,  # Disable pin memory to save GPU memory
             max_length=512,  # Limit sequence length to reduce memory
+            report_to="wandb",  # Explicitly enable wandb reporting
+            logging_first_step=True,  # Log the first step
+            run_name=wandb_run_name if wandb_run_name else None,  # Use same run name across iterations
         )
         
         # DPOTrainer will be initialized when we have training data
         self.dpo_trainer = None
         self.peft_config = peft_config
+        self.global_step = 0  # Track global step across iterations
         print(f"[DPO Trainer] Initialization complete!\n")
         
         self.training_history = []
+    
+    class GlobalStepCallback(TrainerCallback):
+        """Callback to set initial global step for continuous wandb logging"""
+        def __init__(self, initial_step: int = 0):
+            self.initial_step = initial_step
+            self.set = False
+        
+        def on_train_begin(self, args, state, control, **kwargs):
+            """Set global step at the start of training"""
+            if not self.set and self.initial_step > 0:
+                state.global_step = self.initial_step
+                self.set = True
     
     def _create_dpo_dataset(self, training_pairs: List[DPOTrainingPair]) -> Dataset:
         """
@@ -181,33 +200,50 @@ class RLTrainer:
         # Create dataset
         train_dataset = self._create_dpo_dataset(training_pairs)
         
-        # Update DPO config with number of epochs
+        # Update DPO config with number of epochs and ensure logging is enabled
         self.dpo_config.num_train_epochs = num_epochs
+        self.dpo_config.logging_steps = 1  # Log every step to ensure wandb updates frequently
+        self.dpo_config.logging_first_step = True
+        # Ensure wandb run name is set (for reusing same run across iterations)
+        if self.wandb_run_name:
+            self.dpo_config.run_name = self.wandb_run_name
         
-        # Initialize DPOTrainer if not already initialized
-        if self.dpo_trainer is None:
-            print(f"  Initializing DPOTrainer...")
-            # Enable gradient checkpointing on the model to save memory
-            if hasattr(self.model, 'gradient_checkpointing_enable'):
-                self.model.gradient_checkpointing_enable()
-                print(f"  ✓ Gradient checkpointing enabled")
-            
-            self.dpo_trainer = DPOTrainer(
-                model=self.model,
-                args=self.dpo_config,
-                processing_class=self.tokenizer,
-                train_dataset=train_dataset,
-                peft_config=self.peft_config,
-                ref_model=None,  # Use None to share reference model (saves memory)
-            )
-            print(f"  ✓ DPOTrainer initialized")
-        else:
-            # Update dataset
-            self.dpo_trainer.train_dataset = train_dataset
+        # Recreate DPOTrainer for each training batch to ensure proper wandb logging
+        # This ensures a fresh trainer state and proper logging for each iteration
+        print(f"  Initializing DPOTrainer...")
+        # Enable gradient checkpointing on the model to save memory
+        if hasattr(self.model, 'gradient_checkpointing_enable'):
+            self.model.gradient_checkpointing_enable()
+            print(f"  ✓ Gradient checkpointing enabled")
+        
+        # Create callback to set initial global step for continuous wandb logging
+        callbacks = []
+        if self.global_step > 0:
+            step_callback = self.GlobalStepCallback(initial_step=self.global_step)
+            callbacks.append(step_callback)
+            print(f"  Will resume from global step: {self.global_step}")
+        
+        # Create new trainer instance for this training batch
+        # This ensures wandb logging works correctly for each iteration
+        self.dpo_trainer = DPOTrainer(
+            model=self.model,
+            args=self.dpo_config,
+            processing_class=self.tokenizer,
+            train_dataset=train_dataset,
+            peft_config=self.peft_config,
+            ref_model=None,  # Use None to share reference model (saves memory)
+            callbacks=callbacks if callbacks else None,  # Add callback to set initial step
+        )
+        print(f"  ✓ DPOTrainer initialized")
         
         # Train
         print(f"  Starting DPO training...")
         train_result = self.dpo_trainer.train()
+        
+        # Update global step counter for next iteration
+        if hasattr(self.dpo_trainer, 'state'):
+            self.global_step = self.dpo_trainer.state.global_step
+            print(f"  Training completed at global step: {self.global_step}")
         
         # Extract metrics
         training_metrics = {
@@ -216,6 +252,7 @@ class RLTrainer:
             "num_epochs": num_epochs,
             "mean_chosen_reward": float(np.mean([p.score_chosen for p in training_pairs])),
             "mean_rejected_reward": float(np.mean([p.score_rejected for p in training_pairs])),
+            "global_step": self.global_step,
         }
         
         # Store training history

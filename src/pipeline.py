@@ -119,6 +119,11 @@ class GuardrailPipeline:
 
         ### Current list of rules:
         self.approved_rules_dict = {}
+        
+        # Setup wandb run name (same run for all iterations) - must be before RLTrainer init
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        self.wandb_run_name = f"guardrail-reverse-eng-{timestamp}"
+        print(f"Wandb run name: {self.wandb_run_name} (will reuse same run across all iterations)")
 
         #### Initialize RLTrainer (DPO) ####
         rl_config = self.config["rl"]
@@ -131,7 +136,8 @@ class GuardrailPipeline:
             rl_config.get("lora_r", 16),
             rl_config.get("lora_alpha", 32),
             output_dir=rl_config.get("model_output_dir", "./models/whitebox_dpo"),
-            beta=rl_config.get("dpo_beta", 0.1)  # DPO beta parameter
+            beta=rl_config.get("dpo_beta", 0.1),  # DPO beta parameter
+            wandb_run_name=self.wandb_run_name  # Pass wandb run name for consistent logging
         )
         
         
@@ -142,10 +148,11 @@ class GuardrailPipeline:
         #     reward_weights=self.config["rl"]["reward_weights"]
         # )
         
-        # Setup rules log file path
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        # Setup rules log file paths (reuse timestamp from above)
         self.rules_log_file = str(Path(self.config["pipeline"]["log_dir"]) / f"discovered_rules_{timestamp}.jsonl")
+        self.rules_txt_file = str(Path(self.config["pipeline"]["log_dir"]) / f"discovered_rules_{timestamp}.txt")
         print(f"Rules will be logged to: {self.rules_log_file}")
+        print(f"Rules will be saved to: {self.rules_txt_file}")
         
         # Setup prompt-response interaction log file
         self.interactions_log_file = Path(self.config["pipeline"]["log_dir"]) / f"prompt_response_interactions_{timestamp}.jsonl"
@@ -201,6 +208,44 @@ class GuardrailPipeline:
             # Append to JSONL file (one JSON object per line)
             with open(self.interactions_log_file, 'a', encoding='utf-8') as f:
                 f.write(json.dumps(log_entry, ensure_ascii=False) + '\n')
+    
+    def _save_rules_to_txt(self):
+        """
+        Save discovered rules to a human-readable txt file
+        
+        The file will contain:
+        - Total number of rules
+        - Each rule with its reward score, sorted by reward (highest first)
+        """
+        if not self.approved_rules_dict:
+            print("  No rules to save")
+            return
+        
+        # Sort rules by reward (descending)
+        sorted_rules = sorted(
+            self.approved_rules_dict.items(),
+            key=lambda x: x[1]["reward"],
+            reverse=True
+        )
+        
+        # Write to txt file
+        with open(self.rules_txt_file, 'w', encoding='utf-8') as f:
+            f.write("=" * 80 + "\n")
+            f.write("DISCOVERED RULES\n")
+            f.write("=" * 80 + "\n")
+            f.write(f"Total Rules Discovered: {len(sorted_rules)}\n")
+            f.write(f"Last Updated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+            f.write("=" * 80 + "\n\n")
+            
+            for idx, (rule_text, rule_data) in enumerate(sorted_rules, 1):
+                reward = rule_data["reward"]
+                f.write(f"Rule #{idx}\n")
+                f.write("-" * 80 + "\n")
+                f.write(f"Reward Score: {reward:.4f}\n")
+                f.write(f"Rule Text: {rule_text}\n")
+                f.write("\n")
+        
+        print(f"  ✓ Saved {len(sorted_rules)} rules to {self.rules_txt_file}")
     
     def run_iteration(self, iteration_num: int, context: Optional[Dict] = None) -> Dict:
         """
@@ -446,6 +491,9 @@ class GuardrailPipeline:
 
         print(f"Total rules: {len(rule_list)}")
         print(f"Current approved rules dictionary: {self.approved_rules_dict}")
+        
+        # Save rules to txt file after each iteration
+        self._save_rules_to_txt()
 
             
         ## Step 6: Train white-box LLM with DPO

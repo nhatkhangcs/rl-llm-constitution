@@ -4,7 +4,7 @@ This pipeline reverse-engineers the guardrails of a target LLM by using a white-
 
 # Training command
 ```bash
-python main.py --config config.yaml --iterations 10
+python main.py
 ```
 
 # How it works
@@ -14,3 +14,14 @@ python main.py --config config.yaml --iterations 10
 4. Generate evaluation prompts based on rules
 5. Calculate refusal rate reward
 6. Train white-box LLM with reward
+
+# Configs
+ You can configure the pipeline in the config.yaml file.
+ - whitebox_llm: Configuration for the white-box LLM
+ - multi_purpose_llm: Configuration for the multi-purpose LLM
+ - rl: Configuration for the reinforcement learning
+ - rule_inference: Configuration for the rule inference
+ - pipeline: Configuration for the pipeline
+
+# Outcome Rules
+ The outcome rules will be saved in the logs directory as discovered_rules_{timestamp}.txt.
