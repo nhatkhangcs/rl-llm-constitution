@@ -12,10 +12,13 @@ from typing import Dict, List, Optional
 from datetime import datetime
 from pathlib import Path
 from tqdm import tqdm
+from dotenv import load_dotenv
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from src.rl_trainer import RLTrainer, DPOTrainingPair
 from src.utils import *
+
+load_dotenv()
 
 class GuardrailPipeline:
     """Main pipeline for reverse-engineering guardrails"""
@@ -38,24 +41,40 @@ class GuardrailPipeline:
         self.target_llm_config = self.config["multi_purpose_llm"]["target_llm"]
         self.eval_llm_config = self.config["multi_purpose_llm"]["eval_llm"]
         self.rule_llm_config = self.config["multi_purpose_llm"]["rule_llm"]
-        hf_token = os.getenv("HUGGINGFACE_HUB_TOKEN") or os.getenv("HF_TOKEN")
+        self.hf_token = os.getenv("HUGGINGFACE_HUB_TOKEN") or os.getenv("HF_TOKEN")
+
+        print("Config: ", self.config)
+        print("Whitebox LLM config: ", self.whitebox_llm_config)
+        print("Target LLM config: ", self.target_llm_config)
+        print("Eval LLM config: ", self.eval_llm_config)
+        print("Rule LLM config: ", self.rule_llm_config)
 
         #### Initialize models ####
+        
+        # Get device IDs from config (relative to CUDA_VISIBLE_DEVICES)
+        # If CUDA_VISIBLE_DEVICES=3,4, then device_id 0 = GPU 3, device_id 1 = GPU 4
+        whitebox_device_id = self.whitebox_llm_config.get("device_id", 0)
+        general_device_id = self.config["multi_purpose_llm"].get("device_id", 0)
+        
+        # Create explicit device_map for each model
+        whitebox_device_map = f"cuda:{whitebox_device_id}" if torch.cuda.is_available() else None
+        general_device_map = f"cuda:{general_device_id}" if torch.cuda.is_available() else None
+        
+        print(f"[Multi-GPU] White-box model will use device: {whitebox_device_id}")
+        print(f"[Multi-GPU] General-purpose model will use device: {general_device_id}")
         
         # Initialize white-box model FIRST (for RL trainer and prompt generator)
         self.whitebox_model = AutoModelForCausalLM.from_pretrained(
             self.whitebox_llm_config["model_name"],
             torch_dtype=torch.float16 if torch.cuda.is_available() else torch.float32,
-            device_map="auto" if torch.cuda.is_available() else None,
-            token=hf_token
+            device_map=whitebox_device_map,
+            token=self.hf_token
         )
 
         self.whitebox_tokenizer = AutoTokenizer.from_pretrained(
             self.whitebox_llm_config["model_name"],
-            token=hf_token
+            token=self.hf_token
         )
-        if self.whitebox_tokenizer.pad_token is None:
-            self.whitebox_tokenizer.pad_token = self.whitebox_tokenizer.eos_token
 
         # this multi_purpose_model will be:
         # - target llm
@@ -65,13 +84,13 @@ class GuardrailPipeline:
         self.general_purpose_model = AutoModelForCausalLM.from_pretrained(
             self.config["multi_purpose_llm"]["model_name"],
             torch_dtype=torch.float16 if torch.cuda.is_available() else torch.float32,
-            device_map="auto" if torch.cuda.is_available() else None,
-            token=hf_token
+            device_map=general_device_map,
+            token=self.hf_token
         )
 
         self.general_purpose_tokenizer = AutoTokenizer.from_pretrained(
             self.config["multi_purpose_llm"]["model_name"],
-            token=hf_token
+            token=self.hf_token
         )
 
         # self.rule_model = AutoModelForCausalLM.from_pretrained(
@@ -156,7 +175,6 @@ class GuardrailPipeline:
         iteration_num: int,
         generated_prompts: List,
         target_responses: List,
-        rewards: Optional[List] = None
     ):
         """
         Log all prompt-response interactions to JSONL file
@@ -201,6 +219,118 @@ class GuardrailPipeline:
         Returns:
             Dictionary with iteration results
         """
+
+        ## Clear GPU memory and load latest checkpoint
+        print(f"\n[Loading] Preparing to load white-box model for iteration {iteration_num}...")
+        
+        # Step 1: Clear previous white-box model from GPU memory
+        # Note: This only affects the white-box model. The general_purpose_model
+        # remains in memory because it's still referenced (self.general_purpose_model).
+        # torch.cuda.empty_cache() only frees GPU memory that's no longer referenced.
+        if hasattr(self, 'whitebox_model') and self.whitebox_model is not None:
+            print(f"  Clearing previous white-box model from GPU...")
+            del self.whitebox_model
+            self.whitebox_model = None
+        
+        # Clear CUDA cache (only frees unused GPU memory, doesn't delete Python objects)
+        # The general_purpose_model is still referenced, so it remains in GPU memory
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            print(f"  ✓ GPU cache cleared (general_purpose_model still in memory)")
+        
+        # Step 2: Find latest checkpoint
+        model_output_dir = Path(self.config["rl"]["model_output_dir"])
+        latest_checkpoint = None
+        
+        if model_output_dir.exists():
+            # Find all iteration directories
+            iteration_dirs = [d for d in model_output_dir.iterdir() if d.is_dir() and d.name.startswith("iteration_")]
+            if iteration_dirs:
+                # Sort by iteration number and get the latest
+                def get_iteration_num(path):
+                    try:
+                        return int(path.name.split("_")[1])
+                    except:
+                        return -1
+                
+                iteration_dirs.sort(key=get_iteration_num, reverse=True)
+                latest_checkpoint = iteration_dirs[0]
+                print(f"  Found latest checkpoint: {latest_checkpoint.name}")
+        
+        # Step 3: Load model from checkpoint or base model
+        # Get device ID for white-box model (relative to CUDA_VISIBLE_DEVICES)
+        whitebox_device_id = self.whitebox_llm_config.get("device_id", 0)
+        whitebox_device_map = f"cuda:{whitebox_device_id}" if torch.cuda.is_available() else None
+        
+        if latest_checkpoint and latest_checkpoint.exists():
+            checkpoint_path = str(latest_checkpoint)
+            print(f"  Loading white-box model from checkpoint: {checkpoint_path}")
+            self.whitebox_model = AutoModelForCausalLM.from_pretrained(
+                checkpoint_path,
+                torch_dtype=torch.float16 if torch.cuda.is_available() else torch.float32,
+                device_map=whitebox_device_map,
+                token=self.hf_token
+            )
+            # Try to load tokenizer from checkpoint, fallback to base model if not available
+            tokenizer_path = checkpoint_path
+            if not (latest_checkpoint / "tokenizer_config.json").exists():
+                tokenizer_path = self.whitebox_llm_config["model_name"]
+                print(f"  Tokenizer not found in checkpoint, using base model tokenizer")
+        else:
+            print(f"  No checkpoint found, loading base model: {self.whitebox_llm_config['model_name']}")
+            self.whitebox_model = AutoModelForCausalLM.from_pretrained(
+                self.whitebox_llm_config["model_name"],
+                torch_dtype=torch.float16 if torch.cuda.is_available() else torch.float32,
+                device_map=whitebox_device_map,
+                token=self.hf_token
+            )
+            tokenizer_path = self.whitebox_llm_config["model_name"]
+        
+        # Load tokenizer (tokenizers don't use torch_dtype or device_map)
+        self.whitebox_tokenizer = AutoTokenizer.from_pretrained(
+            tokenizer_path,
+            token=self.hf_token
+        )
+        if self.whitebox_tokenizer.pad_token is None:
+            self.whitebox_tokenizer.pad_token = self.whitebox_tokenizer.eos_token
+        
+        print(f"  ✓ White-box model and tokenizer loaded")
+        
+        # Step 4: Update RLTrainer with new model
+        print(f"  Updating RLTrainer with new model...")
+        self.rl_trainer.model = self.whitebox_model
+        self.rl_trainer.tokenizer = self.whitebox_tokenizer
+        self.rl_trainer.device = next(self.whitebox_model.parameters()).device
+        
+        # If using LoRA, check if the loaded model already has LoRA adapters
+        # Models saved with LoRA will have adapters, base models won't
+        if self.config["rl"].get("use_lora", True):
+            from peft import PeftModel
+            # Check if model is already a PEFT model (has adapters)
+            is_peft_model = isinstance(self.whitebox_model, PeftModel) or hasattr(self.whitebox_model, 'peft_config')
+            
+            if not is_peft_model:
+                # Model doesn't have LoRA adapters, apply them
+                print(f"  Applying LoRA adapters to loaded model...")
+                from peft import get_peft_model, LoraConfig, TaskType
+                lora_config = LoraConfig(
+                    task_type=TaskType.CAUSAL_LM,
+                    r=self.config["rl"].get("lora_r", 16),
+                    lora_alpha=self.config["rl"].get("lora_alpha", 32),
+                    lora_dropout=0.1,
+                    target_modules=["q_proj", "v_proj", "k_proj", "o_proj"]
+                )
+                self.whitebox_model = get_peft_model(self.whitebox_model, lora_config)
+                self.rl_trainer.model = self.whitebox_model
+                print(f"  ✓ LoRA adapters applied")
+            else:
+                print(f"  ✓ Model already has LoRA adapters loaded from checkpoint")
+        
+        # Reinitialize DPO trainer if it exists (will be recreated on first train_batch call)
+        if hasattr(self.rl_trainer, 'dpo_trainer'):
+            self.rl_trainer.dpo_trainer = None
+        print(f"  ✓ RLTrainer updated")
+
         print(f"\n{'='*60}")
         print(f"Iteration {iteration_num}")
         print(f"{'='*60}")
@@ -242,7 +372,7 @@ class GuardrailPipeline:
                 "response": response,
                 "intended_type": prompt["intended_type"]
             })
-            self._log_interactions(iteration_num, generated_prompts, target_responses, None)
+            self._log_interactions(iteration_num, generated_prompts, target_responses)
         # # Step 3: Infer rules from RuleInfererLLM
 
         print(f"\n[Step 3] Inferring rules from prompt-response pairs...")
@@ -408,14 +538,7 @@ class GuardrailPipeline:
             print(f"  No DPO pairs available or training disabled")
         
         # Return iteration results
-        return {
-            "iteration": iteration_num,
-            "num_prompts_generated": len(generated_prompts),
-            "num_rules_discovered": len(rule_list),
-            "num_training_samples": len(training_data) if training_data else 0,
-            "training_metrics": training_metrics,
-            "rules_dict": {k: v["reward"] for k, v in self.approved_rules_dict.items()}
-        }
+        return training_metrics
 
 
         
@@ -424,7 +547,6 @@ class GuardrailPipeline:
     def train(self):
         """Run the full training pipeline"""
         num_iterations = self.config["pipeline"]["num_iterations"]
-        checkpoint_every = self.config["pipeline"].get("save_checkpoint_every", 10)
         
         print(f"\n{'='*60}")
         print(f"Starting Guardrail Reverse-Engineering Pipeline")
@@ -443,6 +565,14 @@ class GuardrailPipeline:
         for iteration in tqdm(range(1, num_iterations + 1), desc="Training"):
             # Run iteration
             result = self.run_iteration(iteration, context)
+            print(f"  Training metrics: {result}")
+            
+            # Save model after each iteration
+            if self.config["rl"].get("enable_training", True) and self.rl_trainer:
+                iteration_model_dir = Path(self.config["rl"]["model_output_dir"]) / f"iteration_{iteration}"
+                print(f"\n[Saving] Saving model after iteration {iteration} to {iteration_model_dir}")
+                self.rl_trainer.save_model(str(iteration_model_dir))
+                print(f"  ✓ Model saved to {iteration_model_dir}")
             
             # Update context for next iteration
             # context = {

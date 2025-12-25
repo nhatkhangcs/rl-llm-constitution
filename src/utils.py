@@ -157,8 +157,7 @@ def generate_prompts(model, tokenizer, config, system_prompt, user_prompt, retur
         temperature=config.get("temperature", 0.7),
         do_sample=config.get("do_sample", True),
         top_p=config.get("top_p", 0.9),
-        pad_token_id=tokenizer.pad_token_id,
-        eos_token_id=terminators[0] if len(terminators) == 1 else terminators
+        eos_token_id=terminators
     )
     
     # Extract only the generated part (remove input)

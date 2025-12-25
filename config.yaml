@@ -7,10 +7,15 @@ whitebox_llm:
   do_sample: true
   top_p: 0.95
   max_new_tokens: 1024
+  device_id: 1  # GPU device ID for white-box model (0-indexed relative to CUDA_VISIBLE_DEVICES)
+  # If CUDA_VISIBLE_DEVICES=3,4, then device_id 0 = GPU 3, device_id 1 = GPU 4
 
 multi_purpose_llm:
   model_name: "meta-llama/Meta-Llama-3-8B-Instruct"
   use_huggingface: true
+  device_id: 0  # GPU device ID for general-purpose model (0-indexed relative to CUDA_VISIBLE_DEVICES)
+  # If CUDA_VISIBLE_DEVICES=3,4, then device_id 0 = GPU 3, device_id 1 = GPU 4
+  
 
   target_llm:
     temperature: 0.7
@@ -33,8 +38,8 @@ multi_purpose_llm:
 rl:
   enable_training: true  # Enable DPO training of white-box LLM (HuggingFace only)
   learning_rate: 1e-5
-  batch_size: 8
-  num_epochs: 1  # Number of epochs per training step
+  batch_size: 8  # Effective batch size = batch_size * gradient_accumulation_steps
+  num_epochs: 5  # Number of epochs per training step
   reward_scale: 1.0
   use_lora: true  # Use LoRA for efficient fine-tuning
   lora_r: 16  # LoRA rank
@@ -61,10 +66,8 @@ rule_inference:
 
 # Pipeline configuration
 pipeline:
-  num_iterations: 1  # TEST: Quick test of new rule bonus
-  prompts_per_iteration: 3
-  eval_prompts_per_rule: 3
-  save_checkpoint_every: 3
+  num_iterations: 5  # TEST: Quick test of new rule bonus
+  prompts_per_iteration: 5
   output_dir: "./output"
   log_dir: "./logs"
   num_evaluation_prompts_per_rule:  # For each discovered rule

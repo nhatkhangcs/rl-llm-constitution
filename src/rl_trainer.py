@@ -102,9 +102,13 @@ class RLTrainer:
             per_device_train_batch_size=self.batch_size,  # Use converted int value
             beta=self.beta,  # Use converted float value
             logging_steps=10,
-            save_steps=100,
+            save_strategy="no",  # Disable checkpoint saving during training (avoids tokenizer serialization issues)
             num_train_epochs=1,
             remove_unused_columns=False,
+            gradient_checkpointing=True,  # Enable gradient checkpointing to save memory
+            gradient_accumulation_steps=2,  # Accumulate gradients over 2 steps (effective batch size = batch_size * 2)
+            dataloader_pin_memory=False,  # Disable pin memory to save GPU memory
+            max_length=512,  # Limit sequence length to reduce memory
         )
         
         # DPOTrainer will be initialized when we have training data
@@ -183,12 +187,18 @@ class RLTrainer:
         # Initialize DPOTrainer if not already initialized
         if self.dpo_trainer is None:
             print(f"  Initializing DPOTrainer...")
+            # Enable gradient checkpointing on the model to save memory
+            if hasattr(self.model, 'gradient_checkpointing_enable'):
+                self.model.gradient_checkpointing_enable()
+                print(f"  ✓ Gradient checkpointing enabled")
+            
             self.dpo_trainer = DPOTrainer(
                 model=self.model,
                 args=self.dpo_config,
                 processing_class=self.tokenizer,
                 train_dataset=train_dataset,
                 peft_config=self.peft_config,
+                ref_model=None,  # Use None to share reference model (saves memory)
             )
             print(f"  ✓ DPOTrainer initialized")
         else:
@@ -223,12 +233,16 @@ class RLTrainer:
         save_path = path or self.output_dir
         os.makedirs(save_path, exist_ok=True)
         
-        print(f"Saving model to {save_path}")
-        if self.dpo_trainer is not None:
-            self.dpo_trainer.save_model(save_path)
-        else:
-            self.model.save_pretrained(save_path)
-            self.tokenizer.save_pretrained(save_path)
+        print(f"  Saving model to {save_path}...")
         
-        print(f"Model saved successfully!")
+        # Save model (works for both regular model and PEFT/LoRA models)
+        if self.dpo_trainer is not None and hasattr(self.dpo_trainer, 'model'):
+            # Use the model from DPO trainer (may have LoRA adapters)
+            model_to_save = self.dpo_trainer.model
+        else:
+            model_to_save = self.model
+        
+        # Save model (this is the most important part)
+        model_to_save.save_pretrained(save_path)
+        print(f"  ✓ Model saved successfully to {save_path}")
 
