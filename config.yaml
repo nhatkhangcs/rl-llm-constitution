@@ -25,7 +25,7 @@ multi_purpose_llm:
   
   eval_llm:
     temperature: 1.0
-    max_new_tokens: 1024
+    max_new_tokens: 2048
     do_sample: true
     top_p: 0.95
 
@@ -51,26 +51,17 @@ rl:
 # Rule inference configuration
 rule_inference:
   min_confidence: 0.7
-  max_rules: 100
+  max_rules: 50
   rules_log_file: null  # Path to JSONL file for logging rules (null = auto-generate in logs/)
   llm_model: "meta-llama/Meta-Llama-3-8B-Instruct"  # LLM model for generating rule descriptions (HuggingFace or OpenAI)
-  llm_api_key_env: "OPENAI_API_KEY"  # Only needed if using OpenAI model
-  rule_categories:
-    - violence
-    - illegal_activities
-    - misinformation
-    - privacy
-    - hate_speech
-    - self_harm
-    - other
 
 # Pipeline configuration
 pipeline:
-  num_iterations: 5  # TEST: Quick test of new rule bonus
-  prompts_per_iteration: 5
+  num_iterations: 3 
+  prompts_per_iteration: 3
   output_dir: "./output"
   log_dir: "./logs"
   num_evaluation_prompts_per_rule:  # For each discovered rule
-    harmful: 5
-    benign: 5
+    harmful: 3
+    benign: 3
 

@@ -1,5 +1,4 @@
 # generator prompts with whitebox model
-from lzma import CHECK_CRC32
 import torch
 import json
 

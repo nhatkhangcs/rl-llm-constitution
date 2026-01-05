@@ -65,7 +65,7 @@ class RLTrainer:
             tokenizer: HuggingFace tokenizer
             learning_rate: Learning rate for training
             batch_size: Batch size for training
-            use_lora: Whether to use LoRA for efficient fine-tuning   
+            use_lora: Whether to use LoRA for efficient fine-tuning
             lora_r: LoRA rank
             lora_alpha: LoRA alpha parameter
             output_dir: Directory to save trained models
@@ -223,6 +223,19 @@ class RLTrainer:
             callbacks.append(step_callback)
             print(f"  Will resume from global step: {self.global_step}")
         
+        # If the model already has PEFT adapters attached, avoid passing a new peft_config
+        peft_config_to_use = self.peft_config
+        if self.peft_config is not None:
+            model_has_adapters = hasattr(self.model, "peft_config")
+            try:
+                from peft import PeftModel
+                model_has_adapters = model_has_adapters or isinstance(self.model, PeftModel)
+            except Exception:
+                pass
+            if model_has_adapters:
+                peft_config_to_use = None
+                print("  Model already has PEFT adapters; skipping peft_config to avoid duplicate LoRA wrapping")
+        
         # Create new trainer instance for this training batch
         # This ensures wandb logging works correctly for each iteration
         self.dpo_trainer = DPOTrainer(
@@ -230,7 +243,7 @@ class RLTrainer:
             args=self.dpo_config,
             processing_class=self.tokenizer,
             train_dataset=train_dataset,
-            peft_config=self.peft_config,
+            peft_config=peft_config_to_use,
             ref_model=None,  # Use None to share reference model (saves memory)
             callbacks=callbacks if callbacks else None,  # Add callback to set initial step
         )
@@ -282,4 +295,3 @@ class RLTrainer:
         # Save model (this is the most important part)
         model_to_save.save_pretrained(save_path)
         print(f"  ✓ Model saved successfully to {save_path}")
-

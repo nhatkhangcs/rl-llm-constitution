@@ -20,6 +20,13 @@ from src.utils import *
 
 load_dotenv()
 
+# Set HuggingFace cache directory
+HF_CACHE_DIR = "/home/spotai_large/kvo/.cache/huggingface/hub/"
+os.environ["HF_HOME"] = "/home/spotai_large/kvo/.cache/huggingface"
+os.environ["TRANSFORMERS_CACHE"] = HF_CACHE_DIR
+# Ensure cache directory exists
+Path(HF_CACHE_DIR).mkdir(parents=True, exist_ok=True)
+
 class GuardrailPipeline:
     """Main pipeline for reverse-engineering guardrails"""
     
@@ -63,17 +70,22 @@ class GuardrailPipeline:
         print(f"[Multi-GPU] White-box model will use device: {whitebox_device_id}")
         print(f"[Multi-GPU] General-purpose model will use device: {general_device_id}")
         
+        # Use global HuggingFace cache directory
+        self.hf_cache_dir = HF_CACHE_DIR
+        
         # Initialize white-box model FIRST (for RL trainer and prompt generator)
         self.whitebox_model = AutoModelForCausalLM.from_pretrained(
             self.whitebox_llm_config["model_name"],
             torch_dtype=torch.float16 if torch.cuda.is_available() else torch.float32,
             device_map=whitebox_device_map,
-            token=self.hf_token
+            token=self.hf_token,
+            cache_dir=self.hf_cache_dir
         )
 
         self.whitebox_tokenizer = AutoTokenizer.from_pretrained(
             self.whitebox_llm_config["model_name"],
-            token=self.hf_token
+            token=self.hf_token,
+            cache_dir=self.hf_cache_dir
         )
 
         # this multi_purpose_model will be:
@@ -85,12 +97,14 @@ class GuardrailPipeline:
             self.config["multi_purpose_llm"]["model_name"],
             torch_dtype=torch.float16 if torch.cuda.is_available() else torch.float32,
             device_map=general_device_map,
-            token=self.hf_token
+            token=self.hf_token,
+            cache_dir=self.hf_cache_dir
         )
 
         self.general_purpose_tokenizer = AutoTokenizer.from_pretrained(
             self.config["multi_purpose_llm"]["model_name"],
-            token=self.hf_token
+            token=self.hf_token,
+            cache_dir=self.hf_cache_dir
         )
 
         # self.rule_model = AutoModelForCausalLM.from_pretrained(
@@ -327,14 +341,19 @@ class GuardrailPipeline:
                 self.whitebox_llm_config["model_name"],
                 torch_dtype=torch.float16 if torch.cuda.is_available() else torch.float32,
                 device_map=whitebox_device_map,
-                token=self.hf_token
+                token=self.hf_token,
+                cache_dir=self.hf_cache_dir
             )
             tokenizer_path = self.whitebox_llm_config["model_name"]
         
         # Load tokenizer (tokenizers don't use torch_dtype or device_map)
+        # Only use cache_dir if loading from model name (not checkpoint)
+        tokenizer_kwargs = {"token": self.hf_token}
+        if tokenizer_path == self.whitebox_llm_config["model_name"]:
+            tokenizer_kwargs["cache_dir"] = self.hf_cache_dir
         self.whitebox_tokenizer = AutoTokenizer.from_pretrained(
             tokenizer_path,
-            token=self.hf_token
+            **tokenizer_kwargs
         )
         if self.whitebox_tokenizer.pad_token is None:
             self.whitebox_tokenizer.pad_token = self.whitebox_tokenizer.eos_token
@@ -432,7 +451,7 @@ class GuardrailPipeline:
             # # save the rule to the rules_log_file
             # with open(self.rules_log_file, 'a', encoding='utf-8') as f:
             #     f.write(json.dumps(rule, ensure_ascii=False) + '\n')
-
+        
         # step 4: Measure how good the rules are
         print(f"\n[Step 4] Measuring how good the rules are...")
         for rule in rule_list:
