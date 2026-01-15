@@ -6,6 +6,7 @@ including prompt generation, testing, reward calculation, rule inference, and RL
 """
 
 import os
+import gc
 import json
 import yaml
 from typing import Dict, List, Optional
@@ -20,13 +21,6 @@ from src.utils import *
 
 load_dotenv()
 
-# Set HuggingFace cache directory
-HF_CACHE_DIR = "/home/spotai_large/kvo/.cache/huggingface/hub/"
-os.environ["HF_HOME"] = "/home/spotai_large/kvo/.cache/huggingface"
-os.environ["TRANSFORMERS_CACHE"] = HF_CACHE_DIR
-# Ensure cache directory exists
-Path(HF_CACHE_DIR).mkdir(parents=True, exist_ok=True)
-
 class GuardrailPipeline:
     """Main pipeline for reverse-engineering guardrails"""
     
@@ -39,8 +33,16 @@ class GuardrailPipeline:
         """
         self.config = self._load_config(config_path)
         self.setup_directories()
+        self.hf_cache_dir = self._setup_hf_cache(self.config.get("hf_cache_dir"))
         
         # Initialize shared model manager
+        self.model_output_dir = Path(self.config["rl"].get("model_output_dir", "./models/whitebox_dpo"))
+        # Prefer bf16 for speed if supported; fallback to fp16 on CUDA, otherwise float32
+        bf16_supported = torch.cuda.is_available() and getattr(torch.cuda, "is_bf16_supported", lambda: False)()
+        self.whitebox_dtype = torch.bfloat16 if bf16_supported else torch.float16 if torch.cuda.is_available() else torch.float32
+        self.general_dtype = torch.bfloat16 if bf16_supported else torch.float16 if torch.cuda.is_available() else torch.float32
+        self.whitebox_use_bf16 = self.whitebox_dtype == torch.bfloat16
+        self.whitebox_use_fp16 = self.whitebox_dtype == torch.float16
         
         # Check if using HuggingFace models
         self.whitebox_llm_config = self.config["whitebox_llm"]
@@ -48,7 +50,7 @@ class GuardrailPipeline:
         self.target_llm_config = self.config["multi_purpose_llm"]["target_llm"]
         self.eval_llm_config = self.config["multi_purpose_llm"]["eval_llm"]
         self.rule_llm_config = self.config["multi_purpose_llm"]["rule_llm"]
-        self.hf_token = os.getenv("HUGGINGFACE_HUB_TOKEN") or os.getenv("HF_TOKEN")
+        self.hf_token = os.getenv("HF_TOKEN")
 
         print("Config: ", self.config)
         print("Whitebox LLM config: ", self.whitebox_llm_config)
@@ -70,23 +72,34 @@ class GuardrailPipeline:
         print(f"[Multi-GPU] White-box model will use device: {whitebox_device_id}")
         print(f"[Multi-GPU] General-purpose model will use device: {general_device_id}")
         
-        # Use global HuggingFace cache directory
-        self.hf_cache_dir = HF_CACHE_DIR
-        
         # Initialize white-box model FIRST (for RL trainer and prompt generator)
+        resume_checkpoint = self._find_latest_checkpoint(self.model_output_dir)
+        self.resume_iteration = self._get_iteration_index(resume_checkpoint)
+        whitebox_source = resume_checkpoint if resume_checkpoint else self.whitebox_llm_config["model_name"]
+        if resume_checkpoint:
+            print(f"[White-box] Resuming from checkpoint: {resume_checkpoint}")
+            # Free any lingering GPU cache before loading checkpoint to avoid OOM
+            try:
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+            except Exception:
+                pass
+        else:
+            print(f"[White-box] Loading base model: {whitebox_source}")
         self.whitebox_model = AutoModelForCausalLM.from_pretrained(
-            self.whitebox_llm_config["model_name"],
-            torch_dtype=torch.float16 if torch.cuda.is_available() else torch.float32,
+            whitebox_source,
+            torch_dtype=self.whitebox_dtype,
             device_map=whitebox_device_map,
             token=self.hf_token,
             cache_dir=self.hf_cache_dir
         )
 
         self.whitebox_tokenizer = AutoTokenizer.from_pretrained(
-            self.whitebox_llm_config["model_name"],
+            whitebox_source,
             token=self.hf_token,
             cache_dir=self.hf_cache_dir
         )
+        self.current_whitebox_source = str(whitebox_source)
 
         # this multi_purpose_model will be:
         # - target llm
@@ -95,7 +108,7 @@ class GuardrailPipeline:
 
         self.general_purpose_model = AutoModelForCausalLM.from_pretrained(
             self.config["multi_purpose_llm"]["model_name"],
-            torch_dtype=torch.float16 if torch.cuda.is_available() else torch.float32,
+            torch_dtype=self.general_dtype,
             device_map=general_device_map,
             token=self.hf_token,
             cache_dir=self.hf_cache_dir
@@ -146,6 +159,11 @@ class GuardrailPipeline:
             self.whitebox_tokenizer,
             rl_config["learning_rate"],
             rl_config["batch_size"],
+            rl_config.get("gradient_accumulation_steps", 2),
+            rl_config.get("max_length", 512),
+            self.whitebox_use_bf16,
+            self.whitebox_use_fp16,
+            rl_config.get("gradient_checkpointing", True),
             rl_config.get("use_lora", True),
             rl_config.get("lora_r", 16),
             rl_config.get("lora_alpha", 32),
@@ -165,8 +183,10 @@ class GuardrailPipeline:
         # Setup rules log file paths (reuse timestamp from above)
         self.rules_log_file = str(Path(self.config["pipeline"]["log_dir"]) / f"discovered_rules_{timestamp}.jsonl")
         self.rules_txt_file = str(Path(self.config["pipeline"]["log_dir"]) / f"discovered_rules_{timestamp}.txt")
+        self.rewards_log_file = Path(self.config["pipeline"]["log_dir"]) / f"rule_rewards_{timestamp}.jsonl"
         print(f"Rules will be logged to: {self.rules_log_file}")
         print(f"Rules will be saved to: {self.rules_txt_file}")
+        print(f"Rule rewards will be logged to: {self.rewards_log_file}")
         
         # Setup prompt-response interaction log file
         self.interactions_log_file = Path(self.config["pipeline"]["log_dir"]) / f"prompt_response_interactions_{timestamp}.jsonl"
@@ -178,17 +198,66 @@ class GuardrailPipeline:
         self.iteration_history = []
         self.best_reward = float('-inf')
         self.training_data_buffer = []  # Buffer for RL training
+
+    def _find_latest_checkpoint(self, base_dir: Path) -> Optional[Path]:
+        """
+        Find the latest iteration checkpoint under the model output directory.
+        Preference order:
+        - Highest numbered iteration_* subdir
+        - Otherwise, the base dir itself if it contains a saved model
+        """
+        if not base_dir.exists():
+            return None
+        iteration_dirs = [p for p in base_dir.glob("iteration_*") if p.is_dir()]
+        if iteration_dirs:
+            try:
+                for candidate in sorted(iteration_dirs, key=lambda p: int(p.name.split("_")[-1]), reverse=True):
+                    if self._is_valid_checkpoint_dir(candidate):
+                        return candidate
+            except Exception:
+                pass
+        # If the base dir has model files, allow loading from there
+        return base_dir if self._is_valid_checkpoint_dir(base_dir) else None
+
+    def _get_iteration_index(self, checkpoint_path: Optional[Path]) -> int:
+        """Extract iteration index from checkpoint path name (iteration_N). Base dir = 0."""
+        if checkpoint_path is None:
+            return 0
+        name = checkpoint_path.name
+        if name.startswith("iteration_"):
+            try:
+                return int(name.split("_")[-1])
+            except Exception:
+                return 0
+        return 0
+
+    def _is_valid_checkpoint_dir(self, path: Path) -> bool:
+        """A checkpoint is valid if it has a config.json (or adapter_config.json for PEFT)."""
+        return (path / "config.json").exists() or (path / "adapter_config.json").exists()
     
     def _load_config(self, config_path: str) -> Dict:
         """Load configuration from YAML file"""
         with open(config_path, 'r') as f:
             return yaml.safe_load(f)
+
+    def _setup_hf_cache(self, configured_cache_dir: Optional[str]) -> str:
+        """
+        Configure the HuggingFace cache directory with a configurable path.
+        Priority: config value -> HF_CACHE_DIR env -> default ~/.cache/huggingface/hub
+        """
+        cache_dir = configured_cache_dir or os.getenv("HF_CACHE_DIR")
+        if cache_dir is None:
+            cache_dir = "~/.cache/huggingface/hub"
+        cache_path = Path(cache_dir).expanduser().resolve()
+        cache_path.mkdir(parents=True, exist_ok=True)
+
+        os.environ["TRANSFORMERS_CACHE"] = str(cache_path)
+        os.environ.setdefault("HF_HOME", str(cache_path.parent))
+        return str(cache_path)
     
     def setup_directories(self):
         """Create necessary output directories"""
-        output_dir = Path(self.config["pipeline"]["output_dir"])
         log_dir = Path(self.config["pipeline"]["log_dir"])
-        output_dir.mkdir(parents=True, exist_ok=True)
         log_dir.mkdir(parents=True, exist_ok=True)
     
     def _log_interactions(
@@ -222,6 +291,28 @@ class GuardrailPipeline:
             # Append to JSONL file (one JSON object per line)
             with open(self.interactions_log_file, 'a', encoding='utf-8') as f:
                 f.write(json.dumps(log_entry, ensure_ascii=False) + '\n')
+
+    def _log_rule_reward(
+        self,
+        iteration_num: int,
+        rule: str,
+        reward: float,
+        duplicate: bool,
+        refusal_rates: Dict[str, float],
+        counts: Dict[str, int],
+    ):
+        """Log per-rule reward details to JSONL for later analysis."""
+        log_entry = {
+            "timestamp": datetime.now().isoformat(),
+            "iteration": iteration_num,
+            "rule": rule,
+            "reward": reward,
+            "duplicate": duplicate,
+            "refusal_rates": refusal_rates,
+            "counts": counts,
+        }
+        with open(self.rewards_log_file, 'a', encoding='utf-8') as f:
+            f.write(json.dumps(log_entry, ensure_ascii=False) + '\n')
     
     def _save_rules_to_txt(self):
         """
@@ -282,69 +373,100 @@ class GuardrailPipeline:
         ## Clear GPU memory and load latest checkpoint
         print(f"\n[Loading] Preparing to load white-box model for iteration {iteration_num}...")
         
-        # Step 1: Clear previous white-box model from GPU memory
-        # Note: This only affects the white-box model. The general_purpose_model
-        # remains in memory because it's still referenced (self.general_purpose_model).
-        # torch.cuda.empty_cache() only frees GPU memory that's no longer referenced.
-        if hasattr(self, 'whitebox_model') and self.whitebox_model is not None:
-            print(f"  Clearing previous white-box model from GPU...")
-            del self.whitebox_model
-            self.whitebox_model = None
-        
-        # Clear CUDA cache (only frees unused GPU memory, doesn't delete Python objects)
-        # The general_purpose_model is still referenced, so it remains in GPU memory
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-            print(f"  ✓ GPU cache cleared (general_purpose_model still in memory)")
-        
-        # Step 2: Find latest checkpoint
+        # Step 1: Find latest checkpoint (if any)
         model_output_dir = Path(self.config["rl"]["model_output_dir"])
         latest_checkpoint = None
         
         if model_output_dir.exists():
-            # Find all iteration directories
-            iteration_dirs = [d for d in model_output_dir.iterdir() if d.is_dir() and d.name.startswith("iteration_")]
+            iteration_dirs = [
+                d for d in model_output_dir.iterdir()
+                if d.is_dir() and d.name.startswith("iteration_") and self._is_valid_checkpoint_dir(d)
+            ]
             if iteration_dirs:
-                # Sort by iteration number and get the latest
                 def get_iteration_num(path):
                     try:
                         return int(path.name.split("_")[1])
-                    except:
+                    except Exception:
                         return -1
-                
                 iteration_dirs.sort(key=get_iteration_num, reverse=True)
                 latest_checkpoint = iteration_dirs[0]
                 print(f"  Found latest checkpoint: {latest_checkpoint.name}")
+            else:
+                print(f"  No valid iteration checkpoints found; will load base model")
+        
+        desired_source = str(latest_checkpoint) if latest_checkpoint else self.whitebox_llm_config["model_name"]
+        need_reload = (
+            self.whitebox_model is None or
+            getattr(self, "current_whitebox_source", None) != desired_source
+        )
+        
+        if not need_reload:
+            print(f"  Reusing already loaded white-box model: {self.current_whitebox_source}")
+        else:
+            # Step 2: Clear previous white-box model from GPU memory
+            if hasattr(self, 'whitebox_model') and self.whitebox_model is not None:
+                print(f"  Clearing previous white-box model from GPU...")
+                # Break references held by RLTrainer and its DPOTrainer
+                if hasattr(self, "rl_trainer") and self.rl_trainer is not None:
+                    try:
+                        self.rl_trainer.model = None
+                        if hasattr(self.rl_trainer, "dpo_trainer") and self.rl_trainer.dpo_trainer is not None:
+                            self.rl_trainer.dpo_trainer = None
+                    except Exception:
+                        pass
+                del self.whitebox_model
+                self.whitebox_model = None
+            
+            if torch.cuda.is_available():
+                gc.collect()
+                torch.cuda.empty_cache()
+                print(f"  ✓ GPU cache cleared (general_purpose_model still in memory)")
         
         # Step 3: Load model from checkpoint or base model
         # Get device ID for white-box model (relative to CUDA_VISIBLE_DEVICES)
         whitebox_device_id = self.whitebox_llm_config.get("device_id", 0)
         whitebox_device_map = f"cuda:{whitebox_device_id}" if torch.cuda.is_available() else None
         
-        if latest_checkpoint and latest_checkpoint.exists():
-            checkpoint_path = str(latest_checkpoint)
-            print(f"  Loading white-box model from checkpoint: {checkpoint_path}")
-            self.whitebox_model = AutoModelForCausalLM.from_pretrained(
-                checkpoint_path,
-                torch_dtype=torch.float16 if torch.cuda.is_available() else torch.float32,
-                device_map=whitebox_device_map,
-                token=self.hf_token
-            )
-            # Try to load tokenizer from checkpoint, fallback to base model if not available
-            tokenizer_path = checkpoint_path
-            if not (latest_checkpoint / "tokenizer_config.json").exists():
+        if need_reload:
+            if latest_checkpoint and latest_checkpoint.exists():
+                checkpoint_path = str(latest_checkpoint)
+                print(f"  Loading white-box model from checkpoint: {checkpoint_path}")
+                self.whitebox_model = AutoModelForCausalLM.from_pretrained(
+                    checkpoint_path,
+                    torch_dtype=self.whitebox_dtype,
+                    device_map=whitebox_device_map,
+                    token=self.hf_token
+                )
+                tokenizer_path = checkpoint_path
+                if not (latest_checkpoint / "tokenizer_config.json").exists():
+                    tokenizer_path = self.whitebox_llm_config["model_name"]
+                    print(f"  Tokenizer not found in checkpoint, using base model tokenizer")
+
+                if RLTrainer._model_has_invalid_weights(self.whitebox_model):
+                    print(f"  ⚠️ Checkpoint appears corrupted (NaN/Inf weights). Falling back to base model.")
+                    self.whitebox_model = AutoModelForCausalLM.from_pretrained(
+                        self.whitebox_llm_config["model_name"],
+                        torch_dtype=self.whitebox_dtype,
+                        device_map=whitebox_device_map,
+                        token=self.hf_token,
+                        cache_dir=self.hf_cache_dir
+                    )
+                    tokenizer_path = self.whitebox_llm_config["model_name"]
+            else:
+                print(f"  No checkpoint found, loading base model: {self.whitebox_llm_config['model_name']}")
+                self.whitebox_model = AutoModelForCausalLM.from_pretrained(
+                    self.whitebox_llm_config["model_name"],
+                    torch_dtype=self.whitebox_dtype,
+                    device_map=whitebox_device_map,
+                    token=self.hf_token,
+                    cache_dir=self.hf_cache_dir
+                )
                 tokenizer_path = self.whitebox_llm_config["model_name"]
-                print(f"  Tokenizer not found in checkpoint, using base model tokenizer")
+                if (Path(model_output_dir) / "tokenizer_config.json").exists():
+                    tokenizer_path = str(model_output_dir)
+            self.current_whitebox_source = desired_source
         else:
-            print(f"  No checkpoint found, loading base model: {self.whitebox_llm_config['model_name']}")
-            self.whitebox_model = AutoModelForCausalLM.from_pretrained(
-                self.whitebox_llm_config["model_name"],
-                torch_dtype=torch.float16 if torch.cuda.is_available() else torch.float32,
-                device_map=whitebox_device_map,
-                token=self.hf_token,
-                cache_dir=self.hf_cache_dir
-            )
-            tokenizer_path = self.whitebox_llm_config["model_name"]
+            tokenizer_path = self.current_whitebox_source
         
         # Load tokenizer (tokenizers don't use torch_dtype or device_map)
         # Only use cache_dir if loading from model name (not checkpoint)
@@ -500,8 +622,45 @@ class GuardrailPipeline:
             print(f"  Harmful prompts accepted: {refusal_rate_harmful_accepted}")
 
             ## Calculate reward for the rule
-            reward = compute_rule_reward(refusal_rate_benign_rejected, refusal_rate_harmful_rejected, refusal_rate_harmful_accepted, duplicate, new_rule_bonus=0.1, duplicate_penalty=0.1)
+            reward = compute_rule_reward(
+                refusal_rate_benign_rejected,
+                refusal_rate_harmful_rejected,
+                refusal_rate_harmful_accepted,
+                duplicate,
+                shaping_mode=self.config["rl"].get("shaping_mode", "linear"),
+                new_rule_bonus=self.config["rl"].get("new_rule_bonus", 0.05),
+                duplicate_penalty=self.config["rl"].get("duplicate_penalty", 0.4),
+                w_sound_hr=self.config["rl"].get("w_sound_hr", 1.2),
+                w_sound_br=self.config["rl"].get("w_sound_br", 1.0),
+                w_sound_ha=self.config["rl"].get("w_sound_ha", 1.0),
+                w_complete_hr=self.config["rl"].get("w_complete_hr", 0.6),
+                w_margin_hr=self.config["rl"].get("w_margin_hr", 1.0),
+                w_margin_br=self.config["rl"].get("w_margin_br", 1.0),
+                w_margin_ha=self.config["rl"].get("w_margin_ha", 1.0),
+                w_quad_hr=self.config["rl"].get("w_quad_hr", 1.2),
+                w_quad_ha=self.config["rl"].get("w_quad_ha", 1.0),
+                w_quad_br=self.config["rl"].get("w_quad_br", 1.5),
+                w_br_penalty=self.config["rl"].get("w_br_penalty", 1.6)
+            )
             print(f"  Reward for rule {rule}: {reward}")
+            self._log_rule_reward(
+                iteration_num=iteration_num,
+                rule=rule,
+                reward=reward,
+                duplicate=duplicate,
+                refusal_rates={
+                    "benign_rejected": refusal_rate_benign_rejected,
+                    "benign_accepted": refusal_rate_benign_accepted,
+                    "harmful_rejected": refusal_rate_harmful_rejected,
+                    "harmful_accepted": refusal_rate_harmful_accepted,
+                },
+                counts={
+                    "benign_prompts_rejected": benign_prompts_rejected,
+                    "benign_prompts_total": len(benign_prompts),
+                    "harmful_prompts_accepted": harmful_prompts_accepted,
+                    "harmful_prompts_total": len(harmful_prompts),
+                },
+            )
 
             self.approved_rules_dict[rule] = {
                 "rule": rule,
@@ -601,6 +760,10 @@ class GuardrailPipeline:
                 dpo_pairs,
                 num_epochs=self.config["rl"].get("num_epochs", 1)
             )
+            # Save the updated model after each iteration to allow resume
+            iteration_model_dir = self.model_output_dir / f"iteration_{iteration_num}"
+            print(f"  Saving iteration checkpoint to {iteration_model_dir}")
+            self.rl_trainer.save_model(str(iteration_model_dir))
         else:
             print(f"  No DPO pairs available or training disabled")
         
@@ -614,6 +777,10 @@ class GuardrailPipeline:
     def train(self):
         """Run the full training pipeline"""
         num_iterations = self.config["pipeline"]["num_iterations"]
+        start_iteration = self.resume_iteration + 1 if self.resume_iteration else 1
+        if start_iteration > num_iterations:
+            print(f"\n[Resume] Latest checkpoint iteration_{self.resume_iteration} >= configured iterations ({num_iterations}); nothing to train.")
+            return
         
         print(f"\n{'='*60}")
         print(f"Starting Guardrail Reverse-Engineering Pipeline")
@@ -621,6 +788,8 @@ class GuardrailPipeline:
         print(f"Configuration:")
         print(f"  Total iterations: {num_iterations}")
         print(f"  Prompts per iteration: {self.config['pipeline']['prompts_per_iteration']}")
+        if self.resume_iteration:
+            print(f"  Resuming from iteration {self.resume_iteration}, will run {num_iterations - self.resume_iteration} more iteration(s)")
         # if self.rl_trainer:
         #     print(f"  LoRA: {'ENABLED' if self.config['rl'].get('use_lora', True) else 'DISABLED'}")
         #     print(f"  Batch size: {self.config['rl']['batch_size']}")
@@ -629,17 +798,10 @@ class GuardrailPipeline:
         
         context = None
         
-        for iteration in tqdm(range(1, num_iterations + 1), desc="Training"):
+        for iteration in tqdm(range(start_iteration, num_iterations + 1), desc="Training"):
             # Run iteration
             result = self.run_iteration(iteration, context)
             print(f"  Training metrics: {result}")
-            
-            # Save model after each iteration
-            if self.config["rl"].get("enable_training", True) and self.rl_trainer:
-                iteration_model_dir = Path(self.config["rl"]["model_output_dir"]) / f"iteration_{iteration}"
-                print(f"\n[Saving] Saving model after iteration {iteration} to {iteration_model_dir}")
-                self.rl_trainer.save_model(str(iteration_model_dir))
-                print(f"  ✓ Model saved to {iteration_model_dir}")
             
             # Update context for next iteration
             # context = {
@@ -657,10 +819,6 @@ class GuardrailPipeline:
             #         print(f"  Refusal Rate (harmful): {result['metrics']['refusal_rate_harmful']:.1%}")
             #         print(f"  Refusal Rate (benign): {result['metrics']['refusal_rate_benign']:.1%}")
             #     print(f"  Total Rules Discovered: {result['metrics']['total_rules']}")
-            
-            # # Save checkpoint
-            # if iteration % checkpoint_every == 0:
-            #     self.save_checkpoint(iteration)
             
             # # Train RL model if enabled and buffer is full
             # if self.rl_trainer and len(self.training_data_buffer) >= self.config["rl"]["batch_size"]:
@@ -685,86 +843,4 @@ class GuardrailPipeline:
             #     self.training_data_buffer = []
             #     print(f"  Buffer cleared. Continuing training...")
                 
-            #     # Save model checkpoint
-            #     if iteration % (checkpoint_every * 2) == 0:
-            #         checkpoint_model_dir = Path(self.config["pipeline"]["output_dir"]) / "checkpoints" / f"model_iter_{iteration}"
-            #         print(f"\n  Saving model checkpoint to: {checkpoint_model_dir}")
-            #         self.rl_trainer.save_model(str(checkpoint_model_dir))
-        
-        # # Final training step if there's remaining data
-        # if self.rl_trainer and len(self.training_data_buffer) > 0:
-        #     print(f"\nFinal training step with {len(self.training_data_buffer)} samples...")
-        #     self.rl_trainer.train_batch(
-        #         self.training_data_buffer,
-        #         num_epochs=self.config["rl"].get("num_epochs", 1)
-        #     )
-        #     self.training_data_buffer = []
-        
-        # # Final save
-        # self.save_final_results()
-        
-        # # Save final trained model
-        # if self.rl_trainer:
-        #     final_model_dir = Path(self.config["pipeline"]["output_dir"]) / "final_model"
-        #     self.rl_trainer.save_model(str(final_model_dir))
-        
-        # print("\n" + "=" * 60)
-        # print("Training completed!")
-        # print(f"Total rules discovered: {len(self.rule_inference.constitution.rules)}")
-        # print(f"Best average reward: {self.best_reward:.3f}")
-        # print(f"Rules log file: {self.rules_log_file}")
-        # print(f"Interactions log file: {self.interactions_log_file}")
-        # print("=" * 60)
     
-    def save_checkpoint(self, iteration: int):
-        """Save checkpoint at current iteration"""
-        checkpoint_dir = Path(self.config["pipeline"]["output_dir"]) / "checkpoints"
-        checkpoint_dir.mkdir(parents=True, exist_ok=True)
-        
-        checkpoint_path = checkpoint_dir / f"checkpoint_iter_{iteration}.json"
-        
-        checkpoint_data = {
-            "iteration": iteration,
-            "best_reward": self.best_reward,
-            "constitution_summary": self.rule_inference.get_constitution_summary(),
-            "recent_iterations": self.iteration_history[-10:]  # Last 10 iterations
-        }
-        
-        with open(checkpoint_path, 'w') as f:
-            json.dump(checkpoint_data, f, indent=2)
-        
-        # Export constitution
-        constitution_path = checkpoint_dir / f"constitution_iter_{iteration}.json"
-        self.rule_inference.export_constitution(str(constitution_path))
-    
-    def save_final_results(self):
-        """Save final results and constitution"""
-        output_dir = Path(self.config["pipeline"]["output_dir"])
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        
-        # Save full history
-        history_path = output_dir / f"training_history_{timestamp}.json"
-        with open(history_path, 'w') as f:
-            json.dump(self.iteration_history, f, indent=2)
-        
-        # Export final constitution
-        constitution_path = output_dir / f"final_constitution_{timestamp}.json"
-        self.rule_inference.export_constitution(str(constitution_path))
-        
-        # Save summary report
-        summary_path = output_dir / f"summary_{timestamp}.json"
-        summary = {
-            "total_iterations": len(self.iteration_history),
-            "best_reward": self.best_reward,
-            "final_constitution": self.rule_inference.get_constitution_summary(),
-            "final_rule_count": len(self.rule_inference.constitution.rules)
-        }
-        
-        with open(summary_path, 'w') as f:
-            json.dump(summary, f, indent=2)
-        
-        print(f"\nResults saved to {output_dir}")
-        print(f"  - Training history: {history_path.name}")
-        print(f"  - Final constitution: {constitution_path.name}")
-        print(f"  - Summary: {summary_path.name}")
-

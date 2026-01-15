@@ -1,4 +1,6 @@
 
+hf_cache_dir: "./models/hf_cache"
+
 whitebox_llm:
   model_name: "meta-llama/Meta-Llama-3-8B-Instruct"  # Use HuggingFace Llama for RL + LoRA
   use_huggingface: true  # Required for RL/LoRA
@@ -7,13 +9,13 @@ whitebox_llm:
   do_sample: true
   top_p: 0.95
   max_new_tokens: 1024
-  device_id: 1  # GPU device ID for white-box model (0-indexed relative to CUDA_VISIBLE_DEVICES)
+  device_id: 0  # GPU device ID for white-box model (0-indexed relative to CUDA_VISIBLE_DEVICES)
   # If CUDA_VISIBLE_DEVICES=3,4, then device_id 0 = GPU 3, device_id 1 = GPU 4
 
 multi_purpose_llm:
   model_name: "meta-llama/Meta-Llama-3-8B-Instruct"
   use_huggingface: true
-  device_id: 0  # GPU device ID for general-purpose model (0-indexed relative to CUDA_VISIBLE_DEVICES)
+  device_id: 1  # GPU device ID for general-purpose model (0-indexed relative to CUDA_VISIBLE_DEVICES)
   # If CUDA_VISIBLE_DEVICES=3,4, then device_id 0 = GPU 3, device_id 1 = GPU 4
   
 
@@ -24,7 +26,7 @@ multi_purpose_llm:
     top_p: 0.95
   
   eval_llm:
-    temperature: 1.0
+    temperature: 0.7
     max_new_tokens: 2048
     do_sample: true
     top_p: 0.95
@@ -38,15 +40,31 @@ multi_purpose_llm:
 rl:
   enable_training: true  # Enable DPO training of white-box LLM (HuggingFace only)
   learning_rate: 1e-5
-  batch_size: 8  # Effective batch size = batch_size * gradient_accumulation_steps
-  num_epochs: 5  # Number of epochs per training step
+  batch_size: 2  # Per-device batch size for DPO
+  gradient_accumulation_steps: 2  # Keep effective batch size small to avoid OOM
+  max_length: 128  # Truncate sequences to reduce activation memory
+  num_epochs: 1  # Number of epochs per training step
+  gradient_checkpointing: false  # Disable to speed up if memory allows
   reward_scale: 1.0
   use_lora: true  # Use LoRA for efficient fine-tuning
   lora_r: 16  # LoRA rank
   lora_alpha: 32  # LoRA alpha
   dpo_beta: 0.1  # DPO beta parameter (controls KL penalty strength)
   model_output_dir: "./models/whitebox_dpo"  # Directory to save trained models
-
+  shaping_mode: "linear"  # Shaping mode for reward calculation
+  new_rule_bonus: 0.05  # Bonus for new rules
+  duplicate_penalty: 0.4  # Penalty for duplicate rules
+  w_sound_hr: 1.2  # Weight for soundness of harmful rejections
+  w_sound_br: 1.0  # Weight for soundness of benign rejections
+  w_sound_ha: 1.0  # Weight for soundness of harmful accepts
+  w_complete_hr: 0.6  # Weight for completeness of harmful rejections
+  w_margin_hr: 1.0  # Weight for margin of harmful rejections
+  w_margin_br: 1.0  # Weight for margin of benign rejections
+  w_margin_ha: 1.0  # Weight for margin of harmful accepts
+  w_quad_hr: 1.2  # Weight for quadratic soundness of harmful rejections
+  w_quad_ha: 1.0  # Weight for quadratic soundness of harmful accepts
+  w_quad_br: 1.5  # Weight for quadratic soundness of benign rejections
+  w_br_penalty: 1.6  # Weight for benign penalty
 
 # Rule inference configuration
 rule_inference:
@@ -57,11 +75,9 @@ rule_inference:
 
 # Pipeline configuration
 pipeline:
-  num_iterations: 3 
-  prompts_per_iteration: 3
-  output_dir: "./output"
+  num_iterations: 8
+  prompts_per_iteration: 5
   log_dir: "./logs"
   num_evaluation_prompts_per_rule:  # For each discovered rule
-    harmful: 3
-    benign: 3
-
+    harmful: 5
+    benign: 5

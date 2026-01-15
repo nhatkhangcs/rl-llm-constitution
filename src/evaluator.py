@@ -651,15 +651,18 @@ class EvaluationPipeline:
             self.pipeline.rule_llm_config
         )
         
-        matches = matcher.match_rules(discovered_rules, self.all_ground_truth_rules)
-        metrics = matcher.compute_metrics(matches, self.all_ground_truth_rules)
+        # Use only implanted rules as the evaluation ground truth. The full rule bank
+        # is just a sampling pool and should not be treated as ground-truth coverage.
+        evaluation_ground_truth_rules = self.implanted_rules
+        matches = matcher.match_rules(discovered_rules, evaluation_ground_truth_rules)
+        match_metrics = matcher.compute_metrics(matches, evaluation_ground_truth_rules)
         
         print(f"\n[Evaluation] Matching Metrics:")
-        print(f"  Precision: {metrics.precision:.3f}")
-        print(f"  Recall: {metrics.recall:.3f}")
-        print(f"  F1: {metrics.f1:.3f}")
-        print(f"  Matched {metrics.num_matched_discovered}/{metrics.num_discovered_rules} discovered rules")
-        print(f"  Matched {metrics.num_matched_ground_truth}/{metrics.num_ground_truth_rules} ground-truth rules")
+        print(f"  Precision: {match_metrics.precision:.3f}")
+        print(f"  Recall: {match_metrics.recall:.3f}")
+        print(f"  F1: {match_metrics.f1:.3f}")
+        print(f"  Matched {match_metrics.num_matched_discovered}/{match_metrics.num_discovered_rules} discovered rules")
+        print(f"  Matched {match_metrics.num_matched_ground_truth}/{match_metrics.num_ground_truth_rules} ground-truth rules")
         
         # Evaluate refusal rates for each rule
         print(f"\n[Evaluation] Evaluating refusal rates for rules...")
@@ -683,9 +686,9 @@ class EvaluationPipeline:
                 self.pipeline.target_llm_config,
                 [rule.text]
             )
-            metrics = evaluator.evaluate_rule(rule.text, instrumented.system_prompt)
-            ground_truth_refusal_metrics.append(metrics)
-            print(f"    {rule.id}: HRR={metrics.harmful_rejection_rate:.3f}, HAR={metrics.harmful_acceptance_rate:.3f}, BRR={metrics.benign_rejection_rate:.3f}")
+            rr_metrics = evaluator.evaluate_rule(rule.text, instrumented.system_prompt)
+            ground_truth_refusal_metrics.append(rr_metrics)
+            print(f"    {rule.id}: HRR={rr_metrics.harmful_rejection_rate:.3f}, HAR={rr_metrics.harmful_acceptance_rate:.3f}, BRR={rr_metrics.benign_rejection_rate:.3f}")
         
         # Evaluate discovered rules
         print(f"  Evaluating {len(discovered_rules)} discovered rules...")
@@ -697,23 +700,24 @@ class EvaluationPipeline:
                 self.pipeline.target_llm_config,
                 [rule_text]
             )
-            metrics = evaluator.evaluate_rule(rule_text, instrumented.system_prompt)
-            discovered_refusal_metrics.append(metrics)
+            rr_metrics = evaluator.evaluate_rule(rule_text, instrumented.system_prompt)
+            discovered_refusal_metrics.append(rr_metrics)
         
         # Compile results
         results = {
             "evaluation_timestamp": datetime.now().isoformat(),
             "implanted_rules": [asdict(rule) for rule in self.implanted_rules],
             "all_ground_truth_rules": [asdict(rule) for rule in self.all_ground_truth_rules],
+            "ground_truth_rules_used": [asdict(rule) for rule in evaluation_ground_truth_rules],
             "discovered_rules": discovered_rules,
             "matching_metrics": {
-                "precision": metrics.precision,
-                "recall": metrics.recall,
-                "f1": metrics.f1,
-                "num_ground_truth_rules": metrics.num_ground_truth_rules,
-                "num_discovered_rules": metrics.num_discovered_rules,
-                "num_matched_ground_truth": metrics.num_matched_ground_truth,
-                "num_matched_discovered": metrics.num_matched_discovered,
+                "precision": match_metrics.precision,
+                "recall": match_metrics.recall,
+                "f1": match_metrics.f1,
+                "num_ground_truth_rules": match_metrics.num_ground_truth_rules,
+                "num_discovered_rules": match_metrics.num_discovered_rules,
+                "num_matched_ground_truth": match_metrics.num_matched_ground_truth,
+                "num_matched_discovered": match_metrics.num_matched_discovered,
             },
             "rule_matches": [
                 {

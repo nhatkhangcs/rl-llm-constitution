@@ -15,6 +15,7 @@ from transformers import (
     AutoModelForCausalLM,
     TrainerCallback,
 )
+from transformers.training_args import ParallelMode
 from trl import DPOTrainer, DPOConfig
 from peft import LoraConfig, get_peft_model, TaskType
 import numpy as np
@@ -50,6 +51,11 @@ class RLTrainer:
         tokenizer,
         learning_rate,
         batch_size,
+        gradient_accumulation_steps,
+        max_length,
+        use_bf16,
+        use_fp16,
+        gradient_checkpointing,
         use_lora,
         lora_r,
         lora_alpha,
@@ -76,6 +82,11 @@ class RLTrainer:
         self.device = next(model.parameters()).device
         self.learning_rate = float(learning_rate)
         self.batch_size = int(batch_size)
+        self.gradient_accumulation_steps = int(gradient_accumulation_steps)
+        self.max_length = int(max_length)
+        self.use_bf16 = bool(use_bf16)
+        self.use_fp16 = bool(use_fp16)
+        self.gradient_checkpointing = bool(gradient_checkpointing)
         self.use_lora = use_lora
         self.lora_r = lora_r
         self.lora_alpha = lora_alpha
@@ -108,13 +119,16 @@ class RLTrainer:
             save_strategy="no",  # Disable checkpoint saving during training (avoids tokenizer serialization issues)
             num_train_epochs=1,
             remove_unused_columns=False,
-            gradient_checkpointing=True,  # Enable gradient checkpointing to save memory
-            gradient_accumulation_steps=2,  # Accumulate gradients over 2 steps (effective batch size = batch_size * 2)
+            gradient_checkpointing=self.gradient_checkpointing,
+            gradient_accumulation_steps=self.gradient_accumulation_steps,
             dataloader_pin_memory=False,  # Disable pin memory to save GPU memory
-            max_length=512,  # Limit sequence length to reduce memory
+            max_length=self.max_length,  # Limit sequence length to reduce memory
             report_to="wandb",  # Explicitly enable wandb reporting
             logging_first_step=True,  # Log the first step
             run_name=wandb_run_name if wandb_run_name else None,  # Use same run name across iterations
+            bf16=self.use_bf16,
+            fp16=self.use_fp16,
+            max_grad_norm=1.0,
         )
         
         # DPOTrainer will be initialized when we have training data
@@ -196,6 +210,13 @@ class RLTrainer:
         print(f"  Training on {len(training_pairs)} DPO pairs for {num_epochs} epoch(s)...")
         print(f"  Chosen reward range: [{min(p.score_chosen for p in training_pairs):.3f}, {max(p.score_chosen for p in training_pairs):.3f}]")
         print(f"  Rejected reward range: [{min(p.score_rejected for p in training_pairs):.3f}, {max(p.score_rejected for p in training_pairs):.3f}]")
+        print(
+            f"  DPO settings: per_device_batch={self.dpo_config.per_device_train_batch_size}, "
+            f"grad_accum={self.dpo_config.gradient_accumulation_steps}, "
+            f"max_length={self.dpo_config.max_length}, "
+            f"epochs={num_epochs}, "
+            f"bf16={self.dpo_config.bf16}, fp16={self.dpo_config.fp16}"
+        )
         
         # Create dataset
         train_dataset = self._create_dpo_dataset(training_pairs)
@@ -211,10 +232,30 @@ class RLTrainer:
         # Recreate DPOTrainer for each training batch to ensure proper wandb logging
         # This ensures a fresh trainer state and proper logging for each iteration
         print(f"  Initializing DPOTrainer...")
-        # Enable gradient checkpointing on the model to save memory
-        if hasattr(self.model, 'gradient_checkpointing_enable'):
+        # Configure gradient checkpointing based on config
+        if self.gradient_checkpointing and hasattr(self.model, 'gradient_checkpointing_enable'):
             self.model.gradient_checkpointing_enable()
             print(f"  ✓ Gradient checkpointing enabled")
+        elif not self.gradient_checkpointing and hasattr(self.model, 'gradient_checkpointing_disable'):
+            try:
+                self.model.gradient_checkpointing_disable()
+                print(f"  ✓ Gradient checkpointing disabled")
+            except AttributeError:
+                # Some model versions may not have installed the grad hook; safe to ignore
+                print(f"  ⚠️ Gradient checkpointing disable skipped (hook not set)")
+        # Ensure model is in train mode
+        self.model.train()
+        # If using LoRA, explicitly mark adapter params trainable (some checkpoints load frozen)
+        if self.use_lora:
+            for n, p in self.model.named_parameters():
+                if "lora" in n or "adapter" in n:
+                    p.requires_grad_(True)
+                else:
+                    p.requires_grad_(False)
+        # Log trainable parameter count to detect frozen model issues
+        trainable_params = sum(p.numel() for p in self.model.parameters() if p.requires_grad)
+        total_params = sum(p.numel() for p in self.model.parameters())
+        print(f"  Trainable params: {trainable_params:,} / {total_params:,}")
         
         # Create callback to set initial global step for continuous wandb logging
         callbacks = []
@@ -236,17 +277,42 @@ class RLTrainer:
                 peft_config_to_use = None
                 print("  Model already has PEFT adapters; skipping peft_config to avoid duplicate LoRA wrapping")
         
-        # Create new trainer instance for this training batch
-        # This ensures wandb logging works correctly for each iteration
-        self.dpo_trainer = DPOTrainer(
-            model=self.model,
-            args=self.dpo_config,
-            processing_class=self.tokenizer,
-            train_dataset=train_dataset,
-            peft_config=peft_config_to_use,
-            ref_model=None,  # Use None to share reference model (saves memory)
-            callbacks=callbacks if callbacks else None,  # Add callback to set initial step
-        )
+        # Force single-GPU in Trainer even if multiple devices are visible (avoid torch.nn.DataParallel hang)
+        self.dpo_config._n_gpu = 1
+        if hasattr(self.dpo_config, "local_rank"):
+            self.dpo_config.local_rank = -1
+        original_device_count = torch.cuda.device_count
+        torch.cuda.device_count = lambda: 1  # type: ignore
+        try:
+            self.dpo_trainer = DPOTrainer(
+                model=self.model,
+                args=self.dpo_config,
+                processing_class=self.tokenizer,
+                train_dataset=train_dataset,
+                peft_config=peft_config_to_use,
+                ref_model=None,  # Use None to share reference model (saves memory)
+                callbacks=callbacks if callbacks else None,  # Add callback to set initial step
+            )
+        finally:
+            torch.cuda.device_count = original_device_count  # type: ignore
+        # Explicitly tell Trainer not to data-parallelize
+        self.dpo_trainer.n_gpu = 1
+        if hasattr(self.dpo_trainer, "args"):
+            self.dpo_trainer.args._n_gpu = 1
+            try:
+                # Some HF versions make parallel_mode a property; bypass by setting protected member
+                if hasattr(self.dpo_trainer.args, "_parallel_mode"):
+                    self.dpo_trainer.args._parallel_mode = ParallelMode.NOT_DISTRIBUTED
+                elif hasattr(self.dpo_trainer.args, "parallel_mode"):
+                    object.__setattr__(self.dpo_trainer.args, "parallel_mode", ParallelMode.NOT_DISTRIBUTED)
+            except Exception as e:
+                print(f"  Warning: could not force parallel_mode to NOT_DISTRIBUTED: {e}")
+        try:
+            n_gpu = self.dpo_trainer.args.n_gpu if hasattr(self.dpo_trainer, "args") else "?"
+            pmode = getattr(self.dpo_trainer.args, "parallel_mode", "?") if hasattr(self.dpo_trainer, "args") else "?"
+            print(f"  Trainer device setup: n_gpu={n_gpu}, parallel_mode={pmode}, cuda_visible={os.environ.get('CUDA_VISIBLE_DEVICES', 'all')}")
+        except Exception as e:
+            print(f"  Trainer device setup logging failed: {e}")
         print(f"  ✓ DPOTrainer initialized")
         
         # Train
@@ -278,20 +344,38 @@ class RLTrainer:
         
         return training_metrics
     
+    @staticmethod
+    def _model_has_invalid_weights(model) -> bool:
+        """Check if model parameters contain NaN or Inf values."""
+        import torch
+        for p in model.parameters():
+            if p is not None:
+                if torch.isnan(p).any() or torch.isinf(p).any():
+                    return True
+        return False
+    
     def save_model(self, path: Optional[str] = None):
         """Save the trained model"""
-        save_path = path or self.output_dir
-        os.makedirs(save_path, exist_ok=True)
-        
-        print(f"  Saving model to {save_path}...")
-        
         # Save model (works for both regular model and PEFT/LoRA models)
         if self.dpo_trainer is not None and hasattr(self.dpo_trainer, 'model'):
             # Use the model from DPO trainer (may have LoRA adapters)
             model_to_save = self.dpo_trainer.model
         else:
             model_to_save = self.model
+
+        # Skip saving if weights are invalid
+        if self._model_has_invalid_weights(model_to_save):
+            print(f"  ⚠️ Detected NaN/Inf in model weights; skipping save to avoid corrupt checkpoints.")
+            return
+
+        save_path = path or self.output_dir
+        os.makedirs(save_path, exist_ok=True)
+        
+        print(f"  Saving model to {save_path}...")
         
         # Save model (this is the most important part)
         model_to_save.save_pretrained(save_path)
+        # Save tokenizer alongside for easier reload
+        if self.tokenizer is not None:
+            self.tokenizer.save_pretrained(save_path)
         print(f"  ✓ Model saved successfully to {save_path}")

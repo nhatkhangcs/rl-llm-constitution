@@ -168,7 +168,17 @@ def generate_prompts(model, tokenizer, config, system_prompt, user_prompt, retur
     if return_type == "json":
         start_idx = decoded.find('[')
         end_idx = decoded.rfind(']') + 1
-        parsed_response = json.loads(decoded[start_idx:end_idx])
+        if start_idx == -1 or end_idx <= start_idx:
+            print("  ⚠️ No JSON array found in model response; returning empty list.")
+            return []
+
+        json_blob = decoded[start_idx:end_idx].strip()
+        try:
+            parsed_response = json.loads(json_blob)
+        except json.JSONDecodeError as exc:
+            print(f"  ⚠️ Failed to parse JSON from model response; returning empty list. Error: {exc}")
+            return []
+
         # save parsed response to file
         with open(f"parsed_response.json", "a") as f:
             json.dump(parsed_response, f)
@@ -177,15 +187,50 @@ def generate_prompts(model, tokenizer, config, system_prompt, user_prompt, retur
     else:
         return decoded
 
-def compute_rule_reward(refusal_rate_benign_rejected, refusal_rate_harmful_rejected, refusal_rate_harmful_accepted, duplicate: bool, new_rule_bonus: float = 0.1, duplicate_penalty: float = 0.1):
+def compute_rule_reward(
+    refusal_rate_benign_rejected,
+    refusal_rate_harmful_rejected,
+    refusal_rate_harmful_accepted,
+    duplicate: bool,
+    shaping_mode: str = "linear",
+    new_rule_bonus: float = 0.05,
+    duplicate_penalty: float = 0.4,
+    w_sound_hr: float = 1.2,
+    w_sound_br: float = 1.0,
+    w_sound_ha: float = 1.0,
+    w_complete_hr: float = 0.6,
+    w_margin_hr: float = 1.0,
+    w_margin_br: float = 1.0,
+    w_margin_ha: float = 1.0,
+    w_quad_hr: float = 1.2,
+    w_quad_ha: float = 1.0,
+    w_quad_br: float = 1.5,
+    w_br_penalty: float = 1.6,
+):
     hr = refusal_rate_harmful_rejected
     br = refusal_rate_benign_rejected
     ha = refusal_rate_harmful_accepted
 
-    base = 1.0 * hr - 0.5 * br - 1.0 * ha
-    if duplicate:
-        base -= duplicate_penalty
-    else:
-        base += new_rule_bonus
+    # Redundancy: penalize duplicates, lightly reward new rules.
+    redundancy = -duplicate_penalty if duplicate else new_rule_bonus
 
-    return max(-1.0, min(1.0, base))
+    if shaping_mode == "margin":
+        # Shape for sharp separation between harmful and benign.
+        margin = (w_margin_hr * hr) - (w_margin_br * br)
+        soundness = margin - (w_margin_ha * ha)
+        return soundness + redundancy
+
+    if shaping_mode == "quadratic":
+        # Nonlinear penalty for broad benign rejections.
+        soundness = (w_quad_hr * hr) - (w_quad_ha * ha) - (w_quad_br * (br ** 2))
+        return soundness + redundancy
+
+    if shaping_mode == "penalty":
+        # Stronger benign penalty to discourage generic rules.
+        soundness = (1.0 * hr) - (w_br_penalty * br) - (1.0 * ha)
+        return soundness + redundancy
+
+    # Default: linear soundness + completeness proxy.
+    soundness = (w_sound_hr * hr) - (w_sound_br * br) - (w_sound_ha * ha)
+    completeness = w_complete_hr * hr
+    return soundness + completeness + redundancy

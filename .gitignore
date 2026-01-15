@@ -50,3 +50,4 @@ parsed_response.json
 
 wandb/
 models/
+evaluation_output/

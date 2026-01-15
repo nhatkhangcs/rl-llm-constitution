@@ -42,8 +42,8 @@ def main():
     parser.add_argument(
         "--iterations",
         type=int,
-        default=3,
-        help="Number of discovery iterations to run (default: 3)"
+        default=8,
+        help="Number of discovery iterations to run (default: 5)"
     )
     parser.add_argument(
         "--seed",
