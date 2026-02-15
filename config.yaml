@@ -1,16 +1,22 @@
 
+hf_cache_dir: "./models/hf_cache"
+
 whitebox_llm:
-  model_name: "meta-llama/Meta-Llama-3-8B-Instruct"  # Use HuggingFace Llama for RL + LoRA
+  model_name: "meta-llama/Meta-Llama-3-8B-Instruct"
   use_huggingface: true  # Required for RL/LoRA
-  temperature: 1.0  # Increased for more diversity
-  max_tokens: 150  # Reduced to encourage shorter prompts
-  do_sample: true
-  top_p: 0.95
+  temperature: 0.7  # Increased for more diversity
+  do_sample: True
+  top_p: 0.9
   max_new_tokens: 1024
+  device_id: 0  # GPU device ID for white-box model (0-indexed relative to CUDA_VISIBLE_DEVICES)
+  # If CUDA_VISIBLE_DEVICES=3,4, then device_id 0 = GPU 3, device_id 1 = GPU 4
 
 multi_purpose_llm:
   model_name: "meta-llama/Meta-Llama-3-8B-Instruct"
   use_huggingface: true
+  device_id: 1  # GPU device ID for general-purpose model (0-indexed relative to CUDA_VISIBLE_DEVICES)
+  # If CUDA_VISIBLE_DEVICES=3,4, then device_id 0 = GPU 3, device_id 1 = GPU 4
+  
 
   target_llm:
     temperature: 0.7
@@ -19,9 +25,10 @@ multi_purpose_llm:
     top_p: 0.95
   
   eval_llm:
-    temperature: 1.0
-    max_new_tokens: 1024
-    do_sample: true
+    provider: "openai"
+    model_name: "gpt-4o-mini"
+    temperature: 0.7
+    max_new_tokens: 2048
     top_p: 0.95
 
   rule_llm:
@@ -30,44 +37,66 @@ multi_purpose_llm:
     do_sample: true
     top_p: 0.95
 
+  prompt_generator_llm:
+    provider: "openai"
+    model_name: "gpt-4o-mini"
+    temperature: 0.7
+    max_new_tokens: 1024
+    top_p: 0.95
+
 rl:
   enable_training: true  # Enable DPO training of white-box LLM (HuggingFace only)
   learning_rate: 1e-5
-  batch_size: 8
+  batch_size: 2  # Per-device batch size for DPO
+  gradient_accumulation_steps: 2  # Keep effective batch size small to avoid OOM
+  max_length: 128  # Truncate sequences to reduce activation memory
   num_epochs: 1  # Number of epochs per training step
+  gradient_checkpointing: false  # Disable to speed up if memory allows
   reward_scale: 1.0
   use_lora: true  # Use LoRA for efficient fine-tuning
   lora_r: 16  # LoRA rank
   lora_alpha: 32  # LoRA alpha
   dpo_beta: 0.1  # DPO beta parameter (controls KL penalty strength)
+  ref_device_id: 1  # GPU device for frozen KL reference model
+  kl_coef: 0.1  # KL penalty coefficient for policy-gradient rule optimization
+  policy_num_epochs: 1  # Epochs per inner RL step
+  normalize_advantage: true  # Normalize rewards before policy-gradient update
+  max_grad_norm: 1.0  # Gradient clipping for RL update
+  max_steps_per_iteration: 8  # Maximum inner RL steps per outer iteration
+  step_patience: 3  # Early stopping patience for flat loss across steps
+  step_min_delta: 1e-4  # Minimum RL-loss improvement to reset patience
   model_output_dir: "./models/whitebox_dpo"  # Directory to save trained models
-
+  shaping_mode: "linear"  # Shaping mode for reward calculation
+  new_rule_bonus: 0.05  # Bonus for new rules
+  duplicate_penalty: 0.4  # Penalty for duplicate rules
+  w_sound_hr: 1.2  # Weight for soundness of harmful rejections
+  w_sound_br: 1.0  # Weight for soundness of benign rejections
+  w_sound_ha: 1.0  # Weight for soundness of harmful accepts
+  w_complete_hr: 0.6  # Weight for completeness of harmful rejections
+  w_margin_hr: 1.0  # Weight for margin of harmful rejections
+  w_margin_br: 1.0  # Weight for margin of benign rejections
+  w_margin_ha: 1.0  # Weight for margin of harmful accepts
+  w_quad_hr: 1.2  # Weight for quadratic soundness of harmful rejections
+  w_quad_ha: 1.0  # Weight for quadratic soundness of harmful accepts
+  w_quad_br: 1.5  # Weight for quadratic soundness of benign rejections
+  w_br_penalty: 1.6  # Weight for benign penalty
 
 # Rule inference configuration
 rule_inference:
   min_confidence: 0.7
-  max_rules: 100
+  max_rules: 50
   rules_log_file: null  # Path to JSONL file for logging rules (null = auto-generate in logs/)
-  llm_model: "meta-llama/Meta-Llama-3-8B-Instruct"  # LLM model for generating rule descriptions (HuggingFace or OpenAI)
-  llm_api_key_env: "OPENAI_API_KEY"  # Only needed if using OpenAI model
-  rule_categories:
-    - violence
-    - illegal_activities
-    - misinformation
-    - privacy
-    - hate_speech
-    - self_harm
-    - other
+  llm_model: "meta-llama/Meta-Llama-3-8B-Instruct"
 
 # Pipeline configuration
 pipeline:
-  num_iterations: 1  # TEST: Quick test of new rule bonus
-  prompts_per_iteration: 3
-  eval_prompts_per_rule: 3
-  save_checkpoint_every: 3
-  output_dir: "./output"
+  num_iterations: 8
+  initial_harmful_prompts: 10
+  initial_benign_prompts: 10
+  synthetic_harmful_prompts: 10
+  synthetic_benign_prompts: 10
+  prompts_per_iteration: 5  # Legacy key, no longer used by the new step-based loop
   log_dir: "./logs"
   num_evaluation_prompts_per_rule:  # For each discovered rule
     harmful: 5
     benign: 5
-

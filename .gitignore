@@ -49,3 +49,6 @@ llama/
 parsed_response.json
 
 wandb/
+key.txt
+
+models
